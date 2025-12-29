@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clipboard Sync</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #0a1628 0%, #1a2d4a 50%, #0a1628 100%);
+            min-height: 100vh;
+            color: white;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+        }
+        
+        h1 {
+            text-align: center;
+            margin-bottom: 10px;
+            font-size: 28px;
+            background: linear-gradient(90deg, #4a9eff, #6dd5ed);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .subtitle {
+            text-align: center;
+            color: rgba(255,255,255,0.6);
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        
+        .status-bar {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            margin-bottom: 20px;
+            padding: 12px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 12px;
+        }
+        
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #ff4444;
+        }
+        
+        .status-dot.connected {
+            background: #44ff44;
+            box-shadow: 0 0 10px #44ff44;
+        }
+        
+        .room-section {
+            background: rgba(255,255,255,0.1);
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border: 2px solid rgba(74, 158, 255, 0.3);
+        }
+        
+        .room-label {
+            font-size: 14px;
+            color: rgba(255,255,255,0.7);
+            margin-bottom: 8px;
+        }
+        
+        .room-input-row {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .room-input {
+            flex: 1;
+            padding: 14px 18px;
+            font-size: 24px;
+            font-weight: bold;
+            letter-spacing: 8px;
+            text-align: center;
+            border: none;
+            border-radius: 12px;
+            background: rgba(0,0,0,0.3);
+            color: #4a9eff;
+            outline: none;
+        }
+        
+        .room-input::placeholder {
+            color: rgba(74, 158, 255, 0.4);
+            letter-spacing: 4px;
+        }
+        
+        .btn {
+            padding: 14px 24px;
+            font-size: 16px;
+            font-weight: 600;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+        }
+        
+        .btn:active {
+            transform: translateY(0);
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #4a9eff, #6dd5ed);
+            color: white;
+        }
+        
+        .btn-success {
+            background: linear-gradient(135deg, #44cc44, #66dd66);
+            color: white;
+        }
+        
+        .btn-danger {
+            background: linear-gradient(135deg, #ff4444, #ff6666);
+            color: white;
+        }
+        
+        .btn-secondary {
+            background: rgba(255,255,255,0.2);
+            color: white;
+        }
+        
+        .clipboard-section {
+            background: rgba(255,255,255,0.05);
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border: 2px solid rgba(74, 158, 255, 0.5);
+        }
+        
+        .clipboard-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        
+        .clipboard-title {
+            font-size: 16px;
+            font-weight: 600;
+        }
+        
+        .clipboard-time {
+            font-size: 12px;
+            color: rgba(255,255,255,0.5);
+        }
+        
+        .clipboard-content {
+            background: rgba(0,0,0,0.3);
+            border-radius: 12px;
+            padding: 16px;
+            min-height: 150px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-size: 16px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        
+        .clipboard-content.empty {
+            color: rgba(255,255,255,0.3);
+            font-style: italic;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .clipboard-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 16px;
+        }
+        
+        .clipboard-actions .btn {
+            flex: 1;
+        }
+        
+        .history-section {
+            margin-top: 20px;
+        }
+        
+        .history-title {
+            font-size: 14px;
+            color: rgba(255,255,255,0.6);
+            margin-bottom: 10px;
+        }
+        
+        .history-item {
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        .history-item:hover {
+            background: rgba(255,255,255,0.1);
+        }
+        
+        .history-item-text {
+            font-size: 14px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        
+        .history-item-time {
+            font-size: 11px;
+            color: rgba(255,255,255,0.4);
+            margin-top: 4px;
+        }
+        
+        .toast {
+            position: fixed;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%) translateY(100px);
+            background: rgba(0,0,0,0.9);
+            color: white;
+            padding: 14px 28px;
+            border-radius: 30px;
+            font-size: 14px;
+            font-weight: 500;
+            opacity: 0;
+            transition: all 0.3s;
+            z-index: 1000;
+        }
+        
+        .toast.show {
+            transform: translateX(-50%) translateY(0);
+            opacity: 1;
+        }
+        
+        .instructions {
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+            padding: 16px;
+            margin-top: 20px;
+            font-size: 13px;
+            color: rgba(255,255,255,0.6);
+            line-height: 1.6;
+        }
+        
+        .instructions h3 {
+            color: rgba(255,255,255,0.8);
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        
+        .instructions ol {
+            margin-left: 20px;
+        }
+        
+        @media (max-width: 500px) {
+            .room-input {
+                font-size: 20px;
+                letter-spacing: 6px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📋 Clipboard Sync</h1>
+        <p class="subtitle">Send text from iPhone to PC instantly</p>
+        
+        <div class="status-bar">
+            <div class="status-dot" id="statusDot"></div>
+            <span id="statusText">Not connected</span>
+        </div>
+        
+        <div class="room-section">
+            <div class="room-label">Room Code</div>
+            <div class="room-input-row">
+                <input type="text" 
+                       id="roomCode" 
+                       class="room-input" 
+                       placeholder="0000"
+                       maxlength="6"
+                       pattern="[0-9]*"
+                       inputmode="numeric">
+                <button class="btn btn-primary" id="joinBtn" onclick="joinRoom()">Join</button>
+            </div>
+        </div>
+        
+        <div class="clipboard-section">
+            <div class="clipboard-header">
+                <span class="clipboard-title">📥 Received Text</span>
+                <span class="clipboard-time" id="receivedTime"></span>
+            </div>
+            <div class="clipboard-content empty" id="clipboardContent">
+                Waiting for text...
+            </div>
+            <div class="clipboard-actions">
+                <button class="btn btn-success" onclick="copyToClipboard()">📋 Copy</button>
+                <button class="btn btn-danger" onclick="clearClipboard()">🗑 Clear</button>
+            </div>
+        </div>
+        
+        <div class="history-section" id="historySection" style="display: none;">
+            <div class="history-title">Recent (click to restore)</div>
+            <div id="historyList"></div>
+        </div>
+        
+        <div class="instructions">
+            <h3>How to use:</h3>
+            <ol>
+                <li>Enter the same room code on both devices</li>
+                <li>Click "Join" to connect</li>
+                <li>In Glance app, tap "Send to PC" after dictating</li>
+                <li>Text appears here instantly - click Copy!</li>
+            </ol>
+        </div>
+    </div>
+    
+    <div class="toast" id="toast"></div>
+    
+    <script>
+        let ws = null;
+        let currentRoom = '';
+        let history = [];
+        let currentText = '';
+        
+        // Load saved room code
+        const savedRoom = localStorage.getItem('clipboardSyncRoom');
+        if (savedRoom) {
+            document.getElementById('roomCode').value = savedRoom;
+            // Auto-join on load
+            setTimeout(() => joinRoom(), 500);
+        }
+        
+        function joinRoom() {
+            const roomInput = document.getElementById('roomCode');
+            const room = roomInput.value.trim();
+            
+            if (!room || room.length < 4) {
+                showToast('Please enter a 4-6 digit room code');
+                return;
+            }
+            
+            // Save room code
+            localStorage.setItem('clipboardSyncRoom', room);
+            currentRoom = room;
+            
+            // Connect to WebSocket
+            connectWebSocket(room);
+        }
+        
+        function connectWebSocket(room) {
+            // Close existing connection
+            if (ws) {
+                ws.close();
+            }
+            
+            updateStatus('connecting');
+            
+            // Use the deployed WebSocket server
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws/${room}`;
+            
+            // For local testing, use a simple polling fallback
+            // In production, this would be a real WebSocket server
+            
+            // Simulate connection for now (we'll add real WS server)
+            setTimeout(() => {
+                updateStatus('connected');
+                showToast(`Joined room: ${room}`);
+            }, 500);
+            
+            // Start polling for updates (fallback for simple hosting)
+            startPolling(room);
+        }
+        
+        let pollInterval = null;
+        
+        function startPolling(room) {
+            if (pollInterval) clearInterval(pollInterval);
+            
+            console.log('Starting polling for room:', room);
+            
+            pollInterval = setInterval(async () => {
+                try {
+                    const response = await fetch(`/api/room/${room}`);
+                    if (response.ok) {
+                        const data = await response.json();
+                        console.log('Poll response:', data);
+                        if (data.text && data.text !== currentText) {
+                            console.log('New text detected, calling receiveText');
+                            receiveText(data.text, data.timestamp);
+                        }
+                    }
+                } catch (e) {
+                    console.error('Poll error:', e);
+                }
+            }, 1000);
+        }
+        
+        function updateStatus(status) {
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+            
+            switch(status) {
+                case 'connected':
+                    dot.classList.add('connected');
+                    text.textContent = `Connected to room: ${currentRoom}`;
+                    break;
+                case 'connecting':
+                    dot.classList.remove('connected');
+                    text.textContent = 'Connecting...';
+                    break;
+                default:
+                    dot.classList.remove('connected');
+                    text.textContent = 'Not connected';
+            }
+        }
+        
+        function receiveText(text, timestamp) {
+            console.log('Received text:', text);  // Debug
+            currentText = text;
+            
+            const content = document.getElementById('clipboardContent');
+            const timeEl = document.getElementById('receivedTime');
+            
+            // Set the text content
+            content.textContent = text;
+            content.classList.remove('empty');
+            
+            // Handle timestamp
+            let time;
+            if (timestamp) {
+                time = new Date(typeof timestamp === 'number' ? timestamp : Date.parse(timestamp));
+            } else {
+                time = new Date();
+            }
+            timeEl.textContent = time.toLocaleTimeString();
+            
+            // Add to history
+            addToHistory(text, time);
+            
+            // Flash effect
+            content.style.background = 'rgba(74, 158, 255, 0.3)';
+            setTimeout(() => {
+                content.style.background = 'rgba(0,0,0,0.3)';
+            }, 300);
+            
+            showToast('📥 Text received!');
+        }
+        
+        function addToHistory(text, time) {
+            // Remove duplicates
+            history = history.filter(h => h.text !== text);
+            
+            // Add to front
+            history.unshift({ text, time });
+            
+            // Keep only last 10
+            history = history.slice(0, 10);
+            
+            // Update UI
+            renderHistory();
+        }
+        
+        function renderHistory() {
+            const section = document.getElementById('historySection');
+            const list = document.getElementById('historyList');
+            
+            if (history.length <= 1) {
+                section.style.display = 'none';
+                return;
+            }
+            
+            section.style.display = 'block';
+            list.innerHTML = history.slice(1).map((h, i) => `
+                <div class="history-item" onclick="restoreHistory(${i + 1})">
+                    <div class="history-item-text">${escapeHtml(h.text)}</div>
+                    <div class="history-item-time">${h.time.toLocaleTimeString()}</div>
+                </div>
+            `).join('');
+        }
+        
+        function restoreHistory(index) {
+            const item = history[index];
+            if (item) {
+                receiveText(item.text, item.time);
+            }
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        async function copyToClipboard() {
+            if (!currentText) {
+                showToast('Nothing to copy');
+                return;
+            }
+            
+            try {
+                await navigator.clipboard.writeText(currentText);
+                showToast('✅ Copied to clipboard!');
+            } catch (e) {
+                // Fallback
+                const textarea = document.createElement('textarea');
+                textarea.value = currentText;
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textarea);
+                showToast('✅ Copied to clipboard!');
+            }
+        }
+        
+        function clearClipboard() {
+            currentText = '';
+            const content = document.getElementById('clipboardContent');
+            content.textContent = 'Waiting for text...';
+            content.classList.add('empty');
+            document.getElementById('receivedTime').textContent = '';
+            
+            // Also clear from server so it doesn't keep coming back
+            if (currentRoom) {
+                fetch(`/api/room/${currentRoom}`, { method: 'DELETE' })
+                    .catch(e => console.log('Clear error:', e));
+            }
+            
+            showToast('Cleared');
+        }
+        
+        function showToast(message) {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.classList.add('show');
+            
+            setTimeout(() => {
+                toast.classList.remove('show');
+            }, 2000);
+        }
+        
+        // Handle room code input
+        document.getElementById('roomCode').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                joinRoom();
+            }
+        });
+        
+        // For testing: allow manual text entry via URL param
+        const urlParams = new URLSearchParams(window.location.search);
+        const textParam = urlParams.get('text');
+        const roomParam = urlParams.get('room');
+        
+        if (textParam && roomParam) {
+            document.getElementById('roomCode').value = roomParam;
+            joinRoom();
+            setTimeout(() => receiveText(decodeURIComponent(textParam)), 1000);
+        }
+        
+        // API endpoint for receiving text (for the iOS app to call)
+        // This will be handled by the server, but we expose the function for testing
+        window.receiveFromAPI = function(text) {
+            receiveText(text, new Date());
+        };
+    </script>
+</body>
+</html>
