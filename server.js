@@ -1,0 +1,1260 @@
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const { Pool } = require('pg');
+const Anthropic = require('@anthropic-ai/sdk');
+const OpenAI = require('openai');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Initialize Anthropic client (uses ANTHROPIC_API_KEY env var)
+const anthropic = new Anthropic();
+
+// Initialize OpenAI client (uses OPENAI_API_KEY env var)
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// PostgreSQL connection (uses DATABASE_URL env var from Render)
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+});
+
+// Initialize database table
+async function initDB() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS templates (
+                storage_code VARCHAR(20) PRIMARY KEY,
+                templates JSONB NOT NULL DEFAULT '[]',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS favorites (
+                storage_code VARCHAR(20) PRIMARY KEY,
+                favorites JSONB NOT NULL DEFAULT '[]',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        
+        console.log('Database initialized');
+    } catch (err) {
+        console.error('Database init error:', err.message);
+        // Continue without DB - will use in-memory fallback
+    }
+}
+
+initDB();
+
+// Enable CORS for all origins (so iPhone can call the API)
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));  // Increase limit for templates
+app.use(express.static(path.join(__dirname)));
+
+// In-memory storage for rooms (temporary clipboard sync - doesn't need persistence)
+const rooms = new Map();
+const iphoneMessages = new Map();
+
+// In-memory fallback for templates (if no DB)
+const templatesMemory = new Map();
+const favoritesMemory = new Map();
+
+// Clean up old rooms every 5 minutes
+setInterval(() => {
+    const now = Date.now();
+    for (const [room, data] of rooms.entries()) {
+        if (now - data.timestamp > 3600000) {
+            rooms.delete(room);
+        }
+    }
+    for (const [room, data] of iphoneMessages.entries()) {
+        if (now - data.timestamp > 3600000) {
+            iphoneMessages.delete(room);
+        }
+    }
+}, 300000);
+
+// API: Send text to a room (called by iPhone app)
+app.post('/api/send', (req, res) => {
+    const { room, text } = req.body;
+    
+    if (!room || !text) {
+        return res.status(400).json({ error: 'Missing room or text' });
+    }
+    
+    rooms.set(room, { text, timestamp: Date.now() });
+    console.log(`[${new Date().toISOString()}] Room ${room}: Received ${text.length} chars`);
+    res.json({ success: true, room });
+});
+
+// API: Get text from a room (polled by PC browser)
+app.get('/api/room/:room', (req, res) => {
+    const room = req.params.room;
+    const data = rooms.get(room);
+    
+    if (!data) {
+        return res.json({ text: null });
+    }
+    
+    res.json({ text: data.text, timestamp: data.timestamp });
+});
+
+// API: Clear a room
+app.delete('/api/room/:room', (req, res) => {
+    rooms.delete(req.params.room);
+    res.json({ success: true });
+});
+
+// API: Send text to iPhone (called by PC browser)
+app.post('/api/send-to-iphone', (req, res) => {
+    const { room, text } = req.body;
+    
+    if (!room || !text) {
+        return res.status(400).json({ error: 'Missing room or text' });
+    }
+    
+    iphoneMessages.set(room, { text, timestamp: Date.now() });
+    console.log(`[${new Date().toISOString()}] Room ${room}: Sending to iPhone ${text.length} chars`);
+    res.json({ success: true, room });
+});
+
+// API: Get text for iPhone (polled by iPhone app)
+app.get('/api/iphone/:room', (req, res) => {
+    const room = req.params.room;
+    const data = iphoneMessages.get(room);
+    
+    console.log(`[${new Date().toISOString()}] iPhone polling room ${room}: ${data ? 'has data' : 'empty'}`);
+    
+    if (!data) {
+        return res.json({ text: null });
+    }
+    
+    res.json({ text: data.text, timestamp: data.timestamp });
+});
+
+// API: Clear iPhone message after received
+app.delete('/api/iphone/:room', (req, res) => {
+    iphoneMessages.delete(req.params.room);
+    res.json({ success: true });
+});
+
+// ============ TEMPLATES API (PostgreSQL backed) ============
+
+// API: Save templates for a storage code (REPLACE mode - overwrites cloud)
+app.post('/api/templates/:code', async (req, res) => {
+    const code = req.params.code;
+    const { templates } = req.body;
+    
+    if (!templates) {
+        return res.status(400).json({ error: 'Missing templates' });
+    }
+    
+    try {
+        // Try PostgreSQL first
+        if (process.env.DATABASE_URL) {
+            // Upsert - insert or update
+            await pool.query(`
+                INSERT INTO templates (storage_code, templates, updated_at)
+                VALUES ($1, $2, CURRENT_TIMESTAMP)
+                ON CONFLICT (storage_code) 
+                DO UPDATE SET templates = $2, updated_at = CURRENT_TIMESTAMP
+            `, [code, JSON.stringify(templates)]);
+        } else {
+            // Fallback to memory
+            templatesMemory.set(code, { templates, timestamp: Date.now() });
+        }
+        
+        console.log(`[${new Date().toISOString()}] Code ${code}: Saved ${templates.length} templates`);
+        res.json({ success: true, count: templates.length });
+    } catch (err) {
+        console.error('Save templates error:', err.message);
+        // Fallback to memory
+        templatesMemory.set(code, { templates, timestamp: Date.now() });
+        res.json({ success: true, count: templates.length, storage: 'memory' });
+    }
+});
+
+// API: Merge templates (adds new ones, doesn't delete existing)
+app.post('/api/templates/:code/merge', async (req, res) => {
+    const code = req.params.code;
+    const { templates: newTemplates } = req.body;
+    
+    if (!newTemplates) {
+        return res.status(400).json({ error: 'Missing templates' });
+    }
+    
+    try {
+        let existing = [];
+        
+        // Get existing templates
+        if (process.env.DATABASE_URL) {
+            const result = await pool.query('SELECT templates FROM templates WHERE storage_code = $1', [code]);
+            if (result.rows.length > 0) {
+                existing = typeof result.rows[0].templates === 'string' 
+                    ? JSON.parse(result.rows[0].templates) 
+                    : result.rows[0].templates;
+            }
+        } else {
+            const data = templatesMemory.get(code);
+            if (data) existing = data.templates;
+        }
+        
+        // Merge: add new templates that don't exist (by id)
+        const existingIds = new Set(existing.map(t => t.id));
+        const toAdd = newTemplates.filter(t => !existingIds.has(t.id));
+        const merged = [...existing, ...toAdd];
+        
+        // Save merged
+        if (process.env.DATABASE_URL) {
+            await pool.query(`
+                INSERT INTO templates (storage_code, templates, updated_at)
+                VALUES ($1, $2, CURRENT_TIMESTAMP)
+                ON CONFLICT (storage_code) 
+                DO UPDATE SET templates = $2, updated_at = CURRENT_TIMESTAMP
+            `, [code, JSON.stringify(merged)]);
+        } else {
+            templatesMemory.set(code, { templates: merged, timestamp: Date.now() });
+        }
+        
+        console.log(`[${new Date().toISOString()}] Code ${code}: Merged templates (${existing.length} existing + ${toAdd.length} new = ${merged.length} total)`);
+        res.json({ success: true, added: toAdd.length, total: merged.length });
+    } catch (err) {
+        console.error('Merge templates error:', err.message);
+        res.status(500).json({ error: 'Merge failed' });
+    }
+});
+
+// API: Delete single template by ID
+app.delete('/api/templates/:code/:id', async (req, res) => {
+    const { code, id } = req.params;
+    
+    try {
+        let existing = [];
+        
+        // Get existing templates
+        if (process.env.DATABASE_URL) {
+            const result = await pool.query('SELECT templates FROM templates WHERE storage_code = $1', [code]);
+            if (result.rows.length > 0) {
+                existing = typeof result.rows[0].templates === 'string' 
+                    ? JSON.parse(result.rows[0].templates) 
+                    : result.rows[0].templates;
+            }
+        } else {
+            const data = templatesMemory.get(code);
+            if (data) existing = data.templates;
+        }
+        
+        // Remove the template with matching id
+        const filtered = existing.filter(t => t.id !== id);
+        
+        if (filtered.length === existing.length) {
+            return res.status(404).json({ error: 'Template not found' });
+        }
+        
+        // Save filtered
+        if (process.env.DATABASE_URL) {
+            await pool.query(`
+                INSERT INTO templates (storage_code, templates, updated_at)
+                VALUES ($1, $2, CURRENT_TIMESTAMP)
+                ON CONFLICT (storage_code) 
+                DO UPDATE SET templates = $2, updated_at = CURRENT_TIMESTAMP
+            `, [code, JSON.stringify(filtered)]);
+        } else {
+            templatesMemory.set(code, { templates: filtered, timestamp: Date.now() });
+        }
+        
+        console.log(`[${new Date().toISOString()}] Code ${code}: Deleted template ${id}`);
+        res.json({ success: true, remaining: filtered.length });
+    } catch (err) {
+        console.error('Delete template error:', err.message);
+        res.status(500).json({ error: 'Delete failed' });
+    }
+});
+
+// API: Delete ALL templates for a storage code (clear cloud)
+app.delete('/api/templates/:code', async (req, res) => {
+    const code = req.params.code;
+    
+    try {
+        if (process.env.DATABASE_URL) {
+            await pool.query('DELETE FROM templates WHERE storage_code = $1', [code]);
+        } else {
+            templatesMemory.delete(code);
+        }
+        
+        console.log(`[${new Date().toISOString()}] Code ${code}: Cleared all templates from cloud`);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Clear templates error:', err.message);
+        res.status(500).json({ error: 'Clear failed' });
+    }
+});
+
+// API: Get templates for a storage code
+app.get('/api/templates/:code', async (req, res) => {
+    const code = req.params.code;
+    
+    try {
+        // Try PostgreSQL first
+        if (process.env.DATABASE_URL) {
+            const result = await pool.query('SELECT templates FROM templates WHERE storage_code = $1', [code]);
+            
+            if (result.rows.length > 0) {
+                const templates = result.rows[0].templates;
+                return res.json({ templates: typeof templates === 'string' ? JSON.parse(templates) : templates });
+            }
+        }
+        
+        // Fallback to memory
+        const data = templatesMemory.get(code);
+        if (data) {
+            return res.json({ templates: data.templates });
+        }
+        
+        res.json({ templates: [] });
+    } catch (err) {
+        console.error('Get templates error:', err.message);
+        // Fallback to memory
+        const data = templatesMemory.get(code);
+        res.json({ templates: data ? data.templates : [] });
+    }
+});
+
+// ============ FAVORITES API ============
+
+// API: Save favorites for a storage code (REPLACE mode)
+app.post('/api/favorites/:code', async (req, res) => {
+    const code = req.params.code;
+    const { favorites } = req.body;
+    
+    if (!favorites) {
+        return res.status(400).json({ error: 'Missing favorites' });
+    }
+    
+    try {
+        // Try PostgreSQL first
+        if (process.env.DATABASE_URL) {
+            await pool.query(`
+                INSERT INTO favorites (storage_code, favorites, updated_at)
+                VALUES ($1, $2, CURRENT_TIMESTAMP)
+                ON CONFLICT (storage_code) 
+                DO UPDATE SET favorites = $2, updated_at = CURRENT_TIMESTAMP
+            `, [code, JSON.stringify(favorites)]);
+        } else {
+            // Fallback to memory
+            favoritesMemory.set(code, { favorites, timestamp: Date.now() });
+        }
+        
+        console.log(`[${new Date().toISOString()}] Code ${code}: Saved ${favorites.length} favorites`);
+        res.json({ success: true, count: favorites.length });
+    } catch (err) {
+        console.error('Save favorites error:', err.message);
+        // Fallback to memory
+        favoritesMemory.set(code, { favorites, timestamp: Date.now() });
+        res.json({ success: true, count: favorites.length, storage: 'memory' });
+    }
+});
+
+// API: Merge favorites (adds new ones, doesn't delete existing)
+app.post('/api/favorites/:code/merge', async (req, res) => {
+    const code = req.params.code;
+    const { favorites: newFavorites } = req.body;
+    
+    if (!newFavorites) {
+        return res.status(400).json({ error: 'Missing favorites' });
+    }
+    
+    try {
+        let existing = [];
+        
+        // Get existing favorites
+        if (process.env.DATABASE_URL) {
+            const result = await pool.query('SELECT favorites FROM favorites WHERE storage_code = $1', [code]);
+            if (result.rows.length > 0) {
+                existing = typeof result.rows[0].favorites === 'string' 
+                    ? JSON.parse(result.rows[0].favorites) 
+                    : result.rows[0].favorites;
+            }
+        } else {
+            const data = favoritesMemory.get(code);
+            if (data) existing = data.favorites;
+        }
+        
+        // Merge: add new favorites that don't exist (by exact text match)
+        const existingSet = new Set(existing);
+        const toAdd = newFavorites.filter(f => !existingSet.has(f));
+        const merged = [...existing, ...toAdd];
+        
+        // Save merged
+        if (process.env.DATABASE_URL) {
+            await pool.query(`
+                INSERT INTO favorites (storage_code, favorites, updated_at)
+                VALUES ($1, $2, CURRENT_TIMESTAMP)
+                ON CONFLICT (storage_code) 
+                DO UPDATE SET favorites = $2, updated_at = CURRENT_TIMESTAMP
+            `, [code, JSON.stringify(merged)]);
+        } else {
+            favoritesMemory.set(code, { favorites: merged, timestamp: Date.now() });
+        }
+        
+        console.log(`[${new Date().toISOString()}] Code ${code}: Merged favorites (${existing.length} existing + ${toAdd.length} new = ${merged.length} total)`);
+        res.json({ success: true, added: toAdd.length, total: merged.length });
+    } catch (err) {
+        console.error('Merge favorites error:', err.message);
+        res.status(500).json({ error: 'Merge failed' });
+    }
+});
+
+// API: Delete single favorite by index
+app.delete('/api/favorites/:code/:index', async (req, res) => {
+    const { code, index } = req.params;
+    const idx = parseInt(index);
+    
+    try {
+        let existing = [];
+        
+        // Get existing favorites
+        if (process.env.DATABASE_URL) {
+            const result = await pool.query('SELECT favorites FROM favorites WHERE storage_code = $1', [code]);
+            if (result.rows.length > 0) {
+                existing = typeof result.rows[0].favorites === 'string' 
+                    ? JSON.parse(result.rows[0].favorites) 
+                    : result.rows[0].favorites;
+            }
+        } else {
+            const data = favoritesMemory.get(code);
+            if (data) existing = data.favorites;
+        }
+        
+        if (idx < 0 || idx >= existing.length) {
+            return res.status(404).json({ error: 'Favorite not found' });
+        }
+        
+        // Remove the favorite at index
+        existing.splice(idx, 1);
+        
+        // Save filtered
+        if (process.env.DATABASE_URL) {
+            await pool.query(`
+                INSERT INTO favorites (storage_code, favorites, updated_at)
+                VALUES ($1, $2, CURRENT_TIMESTAMP)
+                ON CONFLICT (storage_code) 
+                DO UPDATE SET favorites = $2, updated_at = CURRENT_TIMESTAMP
+            `, [code, JSON.stringify(existing)]);
+        } else {
+            favoritesMemory.set(code, { favorites: existing, timestamp: Date.now() });
+        }
+        
+        console.log(`[${new Date().toISOString()}] Code ${code}: Deleted favorite at index ${idx}`);
+        res.json({ success: true, remaining: existing.length });
+    } catch (err) {
+        console.error('Delete favorite error:', err.message);
+        res.status(500).json({ error: 'Delete failed' });
+    }
+});
+
+// API: Delete ALL favorites for a storage code (clear cloud)
+app.delete('/api/favorites/:code', async (req, res) => {
+    const code = req.params.code;
+    
+    try {
+        if (process.env.DATABASE_URL) {
+            await pool.query('DELETE FROM favorites WHERE storage_code = $1', [code]);
+        } else {
+            favoritesMemory.delete(code);
+        }
+        
+        console.log(`[${new Date().toISOString()}] Code ${code}: Cleared all favorites from cloud`);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Clear favorites error:', err.message);
+        res.status(500).json({ error: 'Clear failed' });
+    }
+});
+
+// API: Get favorites for a storage code
+app.get('/api/favorites/:code', async (req, res) => {
+    const code = req.params.code;
+    
+    try {
+        // Try PostgreSQL first
+        if (process.env.DATABASE_URL) {
+            const result = await pool.query('SELECT favorites FROM favorites WHERE storage_code = $1', [code]);
+            
+            if (result.rows.length > 0) {
+                const favorites = result.rows[0].favorites;
+                return res.json({ favorites: typeof favorites === 'string' ? JSON.parse(favorites) : favorites });
+            }
+        }
+        
+        // Fallback to memory
+        const data = favoritesMemory.get(code);
+        if (data) {
+            return res.json({ favorites: data.favorites });
+        }
+        
+        res.json({ favorites: [] });
+    } catch (err) {
+        console.error('Get favorites error:', err.message);
+        // Fallback to memory
+        const data = favoritesMemory.get(code);
+        res.json({ favorites: data ? data.favorites : [] });
+    }
+});
+
+// ============ IGNORE RULES API ============
+
+app.get('/api/ignore-rules/:code', async (req, res) => {
+    const { code } = req.params;
+    
+    try {
+        if (process.env.DATABASE_URL) {
+            // Create table if not exists
+            await pool.query(`
+                CREATE TABLE IF NOT EXISTS ignore_rules (
+                    id SERIAL PRIMARY KEY,
+                    storage_code VARCHAR(50),
+                    rule_text TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            `);
+            
+            const result = await pool.query(
+                'SELECT id, rule_text, created_at FROM ignore_rules WHERE storage_code = $1 ORDER BY created_at DESC',
+                [code]
+            );
+            res.json({ rules: result.rows });
+        } else {
+            res.json({ rules: [] });
+        }
+    } catch (e) {
+        console.error('Error loading ignore rules:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/ignore-rules/:code', async (req, res) => {
+    const { code } = req.params;
+    const { rule_text } = req.body;
+    
+    if (!rule_text || !rule_text.trim()) {
+        return res.status(400).json({ error: 'Rule text required' });
+    }
+    
+    try {
+        if (process.env.DATABASE_URL) {
+            const result = await pool.query(
+                'INSERT INTO ignore_rules (storage_code, rule_text) VALUES ($1, $2) RETURNING id, rule_text, created_at',
+                [code, rule_text.trim()]
+            );
+            console.log(`[${new Date().toISOString()}] Ignore rule added for ${code}: ${rule_text.trim()}`);
+            res.json({ success: true, rule: result.rows[0] });
+        } else {
+            res.status(400).json({ error: 'Database not configured' });
+        }
+    } catch (e) {
+        console.error('Error saving ignore rule:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.delete('/api/ignore-rules/:code/:id', async (req, res) => {
+    const { code, id } = req.params;
+    
+    try {
+        if (process.env.DATABASE_URL) {
+            await pool.query(
+                'DELETE FROM ignore_rules WHERE id = $1 AND storage_code = $2',
+                [id, code]
+            );
+            console.log(`[${new Date().toISOString()}] Ignore rule ${id} deleted for ${code}`);
+            res.json({ success: true });
+        } else {
+            res.status(400).json({ error: 'Database not configured' });
+        }
+    } catch (e) {
+        console.error('Error deleting ignore rule:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.delete('/api/ignore-rules/:code', async (req, res) => {
+    const { code } = req.params;
+    
+    try {
+        if (process.env.DATABASE_URL) {
+            const result = await pool.query(
+                'DELETE FROM ignore_rules WHERE storage_code = $1',
+                [code]
+            );
+            console.log(`[${new Date().toISOString()}] All ignore rules cleared for ${code}: ${result.rowCount} deleted`);
+            res.json({ success: true, deleted: result.rowCount });
+        } else {
+            res.status(400).json({ error: 'Database not configured' });
+        }
+    } catch (e) {
+        console.error('Error clearing ignore rules:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ============ MEDICAL VALIDATION API (Claude) ============
+
+app.post('/api/validate', async (req, res) => {
+    const { 
+        text, 
+        templateCode, 
+        model, 
+        depth, 
+        includeSuggestions, 
+        ignoreSpelling, 
+        ignorePunctuation,
+        checkGrammar,
+        flagVagueLanguage,
+        applyCardiologyGuidelines,
+        examData,  // New: structured exam data from Exam Builder
+        userProfile 
+    } = req.body;
+    
+    if (!text) {
+        return res.status(400).json({ error: 'Missing text' });
+    }
+    
+    // ============ GPT-5.2 PATH ============
+    // Handle GPT-5.2 separately and return early - Claude code below remains untouched
+    if (model === 'gpt-5.2') {
+        console.log(`[${new Date().toISOString()}] Using GPT-5.2 for validation`);
+        
+        try {
+            // Load ignore rules for this storage code
+            let userRules = [];
+            if (templateCode && process.env.DATABASE_URL) {
+                try {
+                    const result = await pool.query(
+                        'SELECT rule_text FROM ignore_rules WHERE storage_code = $1',
+                        [templateCode]
+                    );
+                    userRules = result.rows.map(r => r.rule_text);
+                    console.log(`[${new Date().toISOString()}] Loaded ${userRules.length} rules for GPT-5.2`);
+                } catch (err) {
+                    console.error('Error loading rules for GPT-5.2:', err.message);
+                }
+            }
+            
+            // Build system prompt with profile + rules
+            let systemPrompt = `You are a board-certified cardiologist and internal medicine physician reviewing dictated clinical notes.
+
+Your task is to validate dictated clinical notes for:
+- Transcription errors (speech-to-text mistakes, medical homophones)
+- Medical logic errors (contradictions, impossible values)
+- Clinical value mismatches (e.g., "normal EF 15%" is wrong - 15% is severely reduced)
+- High-risk medication alerts
+- Red flag clinical scenarios
+
+Preserve the clinician's intent. Do not add new diagnoses unless clinically necessary. Use professional, billing-safe language.`;
+
+            // Add user profile if provided
+            if (userProfile) {
+                systemPrompt += `
+
+## CLINICIAN PROFILE:
+${userProfile}`;
+            }
+            
+            // Add user rules if any
+            if (userRules.length > 0) {
+                systemPrompt += `
+
+## STANDING RULES (apply to every note):
+${userRules.map((r, i) => `${i + 1}) ${r}`).join('\n')}`;
+            }
+            
+            // Add checkbox-based rules
+            let checkboxRules = [];
+            if (ignoreSpelling) checkboxRules.push('Ignore spelling errors entirely.');
+            if (ignorePunctuation) checkboxRules.push('Ignore punctuation and comma errors entirely.');
+            if (!checkGrammar) checkboxRules.push('Do NOT flag grammar issues.');
+            if (!flagVagueLanguage) checkboxRules.push('Do NOT flag vague language like "some", "few", "recently".');
+            
+            if (checkboxRules.length > 0) {
+                systemPrompt += `
+
+## ADDITIONAL INSTRUCTIONS:
+${checkboxRules.map(r => `- ${r}`).join('\n')}`;
+            }
+            
+            // Add response format instructions
+            systemPrompt += `
+
+## RESPONSE FORMAT:
+Return ONLY valid JSON (no markdown, no backticks) with this exact structure:
+{
+  "issues": [
+    {
+      "type": "transcription|clinical_value|dosage|contradiction|drug_allergy|grammar|spelling|punctuation|vague_language|high_risk_med|red_flag",
+      "severity": "error|warning|info",
+      "original": "exact text from note to highlight",
+      "suggested": "corrected text or null",
+      "explanation": "why this is an issue"
+    }
+  ],
+  "icd10": [
+    {"code": "I50.9", "description": "Heart failure, unspecified"}
+  ],
+  "guidelineAlerts": ${applyCardiologyGuidelines ? `[
+    {
+      "guideline": "Guideline name and year",
+      "finding": "What triggered this alert",
+      "recommendation": "Guideline-based recommendation",
+      "class": "I/IIa/IIb/III",
+      "level": "A/B/C"
+    }
+  ]` : '[]'},
+  "suggestions": ${includeSuggestions ? `{
+    "diagnoses": ["Possible diagnoses to consider"],
+    "diagnosticTests": ["Recommended tests"],
+    "therapeutics": ["Treatment considerations"]
+  }` : 'null'},
+  "summary": "Brief 1-line summary"
+}
+
+If no issues found: {"issues": [], "icd10": [], "guidelineAlerts": [], "suggestions": null, "summary": "No issues found"}`;
+
+            // Build user prompt
+            const userPrompt = `Please review this dictated medical note and identify any issues:
+
+${text}`;
+
+            console.log(`[${new Date().toISOString()}] Calling GPT-5.2 API...`);
+            
+            // Map depth to GPT-5.2 reasoning effort levels: none, low, medium, high, xhigh
+            const effortMap = {
+                'quick': 'low',
+                'light': 'medium', 
+                'medium': 'high',
+                'deep': 'xhigh'
+            };
+            const reasoningEffort = effortMap[depth] || 'medium';
+            
+            // Call GPT-5.2 API (note: temperature not supported with this model)
+            const response = await openai.responses.create({
+                model: "gpt-5.2",
+                input: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: userPrompt }
+                ],
+                reasoning: { effort: reasoningEffort }
+            });
+            
+            // Get the response text
+            const responseText = response.output_text || '';
+            
+            // Calculate actual cost from usage
+            const usage = response.usage || {};
+            const inputTokens = usage.input_tokens || 0;
+            const outputTokens = usage.output_tokens || 0;
+            const reasoningTokens = usage.output_tokens_details?.reasoning_tokens || 0;
+            const cachedTokens = usage.input_tokens_details?.cached_tokens || 0;
+            
+            // GPT-5.2 pricing: $1.75/1M input, $14/1M output, cached input 90% off ($0.175/1M)
+            const inputCost = ((inputTokens - cachedTokens) / 1_000_000) * 1.75;
+            const cachedCost = (cachedTokens / 1_000_000) * 0.175;
+            const outputCost = (outputTokens / 1_000_000) * 14.00;
+            const totalCost = inputCost + cachedCost + outputCost;
+            
+            console.log(`[${new Date().toISOString()}] GPT-5.2 usage: ${inputTokens} in (${cachedTokens} cached), ${outputTokens} out (${reasoningTokens} reasoning), cost: $${totalCost.toFixed(6)}`);
+            
+            // Parse JSON response
+            let result;
+            try {
+                const cleanJson = responseText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+                result = JSON.parse(cleanJson);
+            } catch (parseErr) {
+                console.error('GPT-5.2 JSON parse error:', parseErr.message);
+                result = {
+                    issues: [{ type: "error", severity: "info", original: null, suggested: null, explanation: "Could not parse GPT-5.2 response" }],
+                    icd10: [],
+                    guidelineAlerts: [],
+                    suggestions: null,
+                    summary: "Validation completed but response format was unexpected"
+                };
+            }
+            
+            console.log(`[${new Date().toISOString()}] GPT-5.2 validation complete: ${result.issues?.length || 0} issues found`);
+            
+            // Add usage and cost info to result
+            result.usage = {
+                inputTokens,
+                outputTokens,
+                reasoningTokens,
+                cachedTokens,
+                totalTokens: inputTokens + outputTokens
+            };
+            result.cost = {
+                input: inputCost,
+                cached: cachedCost,
+                output: outputCost,
+                total: totalCost,
+                formatted: `$${totalCost.toFixed(4)}`
+            };
+            result.model = 'gpt-5.2';
+            
+            return res.json(result);
+            
+        } catch (err) {
+            console.error('GPT-5.2 validation error:', err.message);
+            return res.status(500).json({ 
+                error: 'GPT-5.2 validation failed', 
+                message: err.message 
+            });
+        }
+    }
+    
+    // ============ CLAUDE PATH (unchanged) ============
+    // Select Claude model based on request
+    const modelMap = {
+        'sonnet': 'claude-sonnet-4-20250514',
+        'opus': 'claude-opus-4-20250514'
+    };
+    const selectedModel = modelMap[model] || modelMap['sonnet'];
+    
+    // Thinking budget based on depth
+    // Note: Large budgets require streaming, keep values modest
+    const depthMap = {
+        'quick': 0,
+        'light': 2000,
+        'medium': 5000,
+        'deep': 10000
+    };
+    const thinkingBudget = depthMap[depth] || 0;
+    
+    // Build exam insertion instruction if examData provided
+    let examInsertionInstruction = '';
+    if (examData && examData.examText) {
+        examInsertionInstruction = `
+## ⚠️ CRITICAL: EXAM INSERTION REQUIRED ⚠️
+The user has prepared physical exam findings. You MUST insert this exam into the note and return the complete modified note.
+
+**Exam text to insert:**
+<exam_to_insert>
+${examData.examText}
+</exam_to_insert>
+
+**REQUIRED STEPS:**
+1. Find the physical exam section in the note. Look for:
+   - "PHYSICAL EXAM:" or "PE:" or "Exam:" or "Physical Examination:"
+   - "[EXAM]" or "[PE]" or similar placeholders
+   - "OBJECTIVE:" section in SOAP format
+   - Any exam-related header or section
+2. REPLACE the existing exam content (or placeholder) with the exam text above
+3. If no exam section exists, INSERT after vital signs or after the HPI section
+4. In your JSON response, you MUST include:
+   - "modifiedNote": The COMPLETE note text with exam inserted, wrapped with %%EXAM_INSERT_START%% before the inserted exam and %%EXAM_INSERT_END%% after it
+   - "examInsertedAt": Description of where you inserted it (e.g., "Replaced PHYSICAL EXAM section")
+
+**EXAMPLE modifiedNote format:**
+"...prior note text...\\n\\nPHYSICAL EXAM:\\n%%EXAM_INSERT_START%%CV: RRR, normal S1/S2...%%EXAM_INSERT_END%%\\n\\n...rest of note..."
+
+THIS IS MANDATORY - DO NOT SKIP THE modifiedNote FIELD!
+`;
+    }
+    
+    console.log(`[${new Date().toISOString()}] Validating ${text.length} chars with ${selectedModel}, depth: ${depth || 'quick'}, thinking: ${thinkingBudget}, suggestions: ${includeSuggestions || false}, examData: ${examData ? 'yes' : 'no'}, profile: ${userProfile ? 'yes' : 'no'}`);
+    
+    // Load templates to exclude if templateCode provided
+    let templateExclusions = '';
+    if (templateCode) {
+        try {
+            let templates = [];
+            if (process.env.DATABASE_URL) {
+                const result = await pool.query('SELECT templates FROM templates WHERE storage_code = $1', [templateCode]);
+                if (result.rows.length > 0) {
+                    templates = typeof result.rows[0].templates === 'string' 
+                        ? JSON.parse(result.rows[0].templates) 
+                        : result.rows[0].templates;
+                }
+            } else {
+                const data = templatesMemory.get(templateCode);
+                if (data) templates = data.templates;
+            }
+            
+            if (templates.length > 0) {
+                const templateTexts = templates.map(t => t.text).join('\n---\n');
+                templateExclusions = `
+
+## TEMPLATE TEXT TO IGNORE:
+The following are saved templates. Do NOT flag any text that matches these templates as errors - they are intentional boilerplate:
+<templates>
+${templateTexts}
+</templates>
+`;
+            }
+        } catch (err) {
+            console.error('Error loading templates for exclusion:', err.message);
+        }
+    }
+    
+    // Load ignore rules if templateCode provided
+    let ignoreRulesSection = '';
+    if (templateCode) {
+        try {
+            if (process.env.DATABASE_URL) {
+                const result = await pool.query(
+                    'SELECT rule_text FROM ignore_rules WHERE storage_code = $1',
+                    [templateCode]
+                );
+                if (result.rows.length > 0) {
+                    const rules = result.rows.map(r => `- ${r.rule_text}`).join('\n');
+                    ignoreRulesSection = `
+
+## USER RULES & PREFERENCES:
+The user has specified the following rules and preferences. Follow these instructions carefully:
+${rules}
+
+These may include things to ignore, things to always check for, reminders to include certain information, or other preferences. Respect all of them.
+`;
+                    console.log(`[${new Date().toISOString()}] Loaded ${result.rows.length} ignore rules`);
+                }
+            }
+        } catch (err) {
+            console.error('Error loading ignore rules:', err.message);
+        }
+    }
+    
+    try {
+        // max_tokens must be greater than thinking budget
+        // Add 4096 for actual response on top of thinking
+        const maxTokens = thinkingBudget > 0 ? thinkingBudget + 4096 : 4096;
+        
+        // Build API request options
+        const apiOptions = {
+            model: selectedModel,
+            max_tokens: maxTokens,
+            messages: [{
+                role: "user",
+                content: `You are an expert medical transcription reviewer with deep knowledge of cardiology, internal medicine, and clinical documentation. Analyze this dictation thoroughly.
+${userProfile ? `
+## USER PROFILE:
+The user has provided the following context about themselves. Adjust your tone, detail level, and explanations accordingly:
+${userProfile}
+` : ''}
+## TEMPLATE PLACEHOLDERS TO IGNORE:
+Do NOT flag the following as errors - they are intentional template placeholders:
+- Bracketed placeholders: [PATIENT NAME], [DATE], [DOS], [DOB], [PROVIDER], [MRN], etc.
+- Blank lines or underscores: ______, _________
+- Variable placeholders: {{variable}}, {date}, {name}
+- All-caps section headers: CHIEF COMPLAINT:, ASSESSMENT:, PLAN:, HPI:, etc.
+- Standard template phrases like "as above", "see above", "as discussed"
+${templateExclusions}
+${ignoreRulesSection}
+${examInsertionInstruction}
+## CHECKS TO PERFORM:
+
+1. **Transcription errors**: Speech-to-text mistakes, medical homophones (ileum/ilium, prostate/prostrate, mucus/mucous, fifteen/fifty)
+
+2. **Clinical value contradictions**: Numbers that don't match their descriptors:
+   - "Normal EF 15%" (normal is 55-70%, 15% is severely reduced)
+   - "Bradycardia at 110 bpm" (that's tachycardia)
+   - "Mild AS with AVA 0.7" (that's severe AS)
+   - "Normal QTc 580ms" (that's prolonged)
+   - "Hypertensive at 110/70" (that's normal)
+   - Any vital sign, lab value, or measurement that contradicts its descriptor
+
+3. **Dosage red flags**: Amounts outside typical ranges
+
+4. **Internal contradictions**: Gender/procedure mismatches, conflicting diagnoses, rhythm vs treatment mismatches
+
+5. **Anatomical impossibilities**: Procedures on removed organs, impossible combinations
+
+6. **Drug-allergy conflicts**: Prescriptions that conflict with documented allergies
+
+7. **Drug-condition conflicts**: Beta-blocker with severe bradycardia, etc.
+
+8. **Missing critical info**: Allergies mentioned but not listed, incomplete documentation
+
+9. **Spelling errors**: Non-medical typos and misspellings (proper nouns, common words)
+
+10. **Grammar issues**: Subject-verb disagreement, tense inconsistencies, sentence fragments, run-on sentences, awkward phrasing
+
+11. **Punctuation & formatting**: Missing periods, incorrect comma usage, capitalization errors, inconsistent formatting
+
+12. **Vague language**: Flag imprecise terms that should be quantified:
+   - "some", "a few", "several", "many" → suggest specific numbers
+   - "recently", "a while ago", "occasionally" → suggest specific timeframes
+   - "improved", "worsened", "stable" → suggest measurable comparisons
+
+13. **HIGH-RISK MEDICATION CHECKER**: Flag any mention of high-risk medications that require extra scrutiny:
+   - **Anticoagulants**: Warfarin, heparin, enoxaparin, rivaroxaban, apixaban, dabigatran, edoxaban
+     → Check for: INR/anti-Xa mentioned? Bleeding risk assessed? Indication documented?
+   - **Insulin**: Any insulin product
+     → Check for: Blood glucose mentioned? Dose seems appropriate? Hypoglycemia risk?
+   - **Opioids**: Morphine, oxycodone, hydrocodone, fentanyl, hydromorphone, methadone
+     → Check for: Pain scale documented? Duration/quantity appropriate? Naloxone discussed?
+   - **Antiarrhythmics**: Amiodarone, sotalol, flecainide, dofetilide
+     → Check for: QTc mentioned? Monitoring plan? Drug interactions?
+   - **Digoxin**: Check for renal function, potassium, drug level monitoring
+   - **Chemotherapy agents**: Any chemo drug → verify dosing, labs, consent
+   - **High-alert IV drugs**: Potassium chloride, vasopressors, sedatives
+   
+   For each high-risk med, flag as WARNING or ERROR if:
+   - Required monitoring not mentioned
+   - Dose seems outside typical range
+   - Potential dangerous interaction with another med or condition in the note
+   - Duration/quantity concerning
+
+14. **RED FLAG DETECTOR**: Identify clinical scenarios that warrant urgent attention or specific workup:
+   - **Chest pain + risk factors** → Is ACS workup documented? Troponin, EKG mentioned?
+   - **Syncope** → Is cardiac vs neurologic workup addressed? Driving restrictions?
+   - **New neurologic deficits** → Stroke workup? Time of onset documented?
+   - **Severe hypertension** (SBP >180 or DBP >120) → End-organ damage assessed?
+   - **Hypotension with symptoms** → Etiology addressed? Fluid status?
+   - **Acute dyspnea** → Differential documented? (PE, HF, pneumonia, COPD exac)
+   - **GI bleed signs** (melena, hematemesis, coffee-ground) → Hemoglobin? GI consult?
+   - **Acute kidney injury** → Baseline creatinine compared? Nephrotoxins reviewed?
+   - **Altered mental status** → Infection, metabolic, intracranial causes addressed?
+   - **New murmur + fever** → Endocarditis workup mentioned?
+   - **DVT symptoms + risk factors** → Ultrasound or D-dimer plan?
+   - **Suicidal ideation** → Safety assessment documented?
+   
+   For each red flag, create an issue with:
+   - type: "red_flag"
+   - severity: "error" (critical) or "warning" (should address)
+   - The clinical finding that triggered it
+   - What documentation/workup may be missing
+
+## RESPONSE FORMAT:
+
+For EACH issue, you MUST provide:
+- "original": The exact problematic text from the dictation (so it can be found and replaced)
+- "suggested": The corrected text to replace it with
+- "explanation": Why this is an issue
+
+Return JSON only (no markdown, no backticks):
+{
+  "issues": [
+    {
+      "type": "clinical_value",
+      "severity": "error",
+      "original": "Normal ejection fraction of 15%",
+      "suggested": "Severely reduced ejection fraction of 15%",
+      "explanation": "15% EF is severely reduced (normal is 55-70%), not normal. Verify if 15% is correct or if it should be 50-55%."
+    },
+    {
+      "type": "transcription",
+      "severity": "warning",
+      "original": "history of dye-a-beat-ease",
+      "suggested": "history of diabetes",
+      "explanation": "Likely speech-to-text error for 'diabetes'"
+    },
+    {
+      "type": "grammar",
+      "severity": "info",
+      "original": "Patient have chest pain",
+      "suggested": "Patient has chest pain",
+      "explanation": "Subject-verb agreement: singular 'patient' requires 'has'"
+    },
+    {
+      "type": "vague_language",
+      "severity": "info",
+      "original": "some chest pain recently",
+      "suggested": "chest pain for the past 3 days",
+      "explanation": "'Some' and 'recently' are vague - specify quantity and timeframe"
+    },
+    {
+      "type": "high_risk_med",
+      "severity": "warning",
+      "original": "Started on warfarin 5mg daily",
+      "suggested": null,
+      "explanation": "High-risk anticoagulant: Consider documenting INR monitoring plan and bleeding precautions"
+    },
+    {
+      "type": "red_flag",
+      "severity": "error",
+      "original": "chest pain radiating to left arm",
+      "suggested": null,
+      "explanation": "Red flag: Chest pain with radiation - ensure ACS workup documented (troponin, EKG results, disposition)"
+    }
+  ],
+  "icd10": [
+    {"code": "I50.9", "description": "Heart failure, unspecified"},
+    {"code": "I10", "description": "Essential (primary) hypertension"}
+  ],
+  "guidelineAlerts": [
+    {
+      "guideline": "2022 AHA/ACC/HFSA Heart Failure Guideline",
+      "finding": "EF 35% with NYHA Class II symptoms on ACE inhibitor only",
+      "recommendation": "Four pillars of GDMT recommended: ARNI (or ACEi), beta-blocker, MRA, and SGLT2i. Consider ICD for primary prevention if EF remains ≤35% after 3+ months of optimized GDMT.",
+      "class": "I",
+      "level": "A"
+    }
+  ],
+  "modifiedNote": "REQUIRED if exam insertion was requested. Contains the FULL original note with exam inserted, with %%EXAM_INSERT_START%% and %%EXAM_INSERT_END%% markers around the inserted exam. Set to null ONLY if no exam was requested.",
+  "examInsertedAt": "REQUIRED if exam insertion was requested. Describes where inserted (e.g., 'Replaced PHYSICAL EXAM section'). Set to null ONLY if no exam was requested.",
+  "suggestions": ${includeSuggestions ? `{
+    "diagnoses": ["Possible differential diagnoses to consider"],
+    "diagnosticTests": ["Recommended tests to confirm or rule out conditions"],
+    "therapeutics": ["Treatment considerations based on findings"]
+  }` : 'null'},
+  "summary": "Brief 1-line summary"
+}
+
+Severity levels: "error" (critical/dangerous), "warning" (should review), "info" (minor/suggestion)
+Issue types include: "transcription", "clinical_value", "dosage", "contradiction", "drug_allergy", "drug_condition", "grammar", "spelling", "punctuation", "vague_language", "high_risk_med", "red_flag"
+
+IMPORTANT: The "original" field must contain the EXACT text from the dictation so it can be found and replaced. If you cannot find exact text to replace, set original to null.
+
+If no issues: {"issues": [], "icd10": [...], "guidelineAlerts": [], "modifiedNote": null, "examInsertedAt": null, "suggestions": null, "summary": "No issues found"}
+${includeSuggestions ? `
+## CLINICAL SUGGESTIONS REQUESTED:
+The user has requested clinical suggestions. Please include in your response:
+- **Diagnosis conclusions**: Based on the clinical picture, what diagnoses are supported or should be considered?
+- **Diagnostic tests**: What additional tests might help confirm, rule out, or further evaluate the conditions mentioned?
+- **Therapeutic suggestions**: Based on the findings and likely diagnoses, what treatment approaches should be considered?
+
+Keep suggestions evidence-based, relevant to the specific case, and appropriately cautious. These are meant as decision support, not definitive recommendations.
+` : ''}${!checkGrammar ? `
+## SKIP GRAMMAR:
+Do NOT flag grammar issues (subject-verb agreement, tense, sentence structure). Focus on medical/clinical content.
+` : ''}${ignoreSpelling ? `
+## SKIP SPELLING:
+Do NOT flag spelling errors or typos. Focus only on medical/clinical issues, not spelling mistakes.
+` : ''}${ignorePunctuation ? `
+## SKIP PUNCTUATION:
+Do NOT flag punctuation issues (missing periods, commas, capitalization, etc). Focus only on medical/clinical content.
+` : ''}${!flagVagueLanguage ? `
+## SKIP VAGUE LANGUAGE:
+Do NOT flag vague terms like "some", "few", "recently". Focus on medical errors only.
+` : ''}${!applyCardiologyGuidelines ? `
+## CARDIOLOGY GUIDELINES DISABLED:
+Do NOT include any guidelineAlerts in your response. The guidelineAlerts array must be empty []. Do not proactively suggest ACC/AHA/HRS guideline-based recommendations.
+` : ''}${applyCardiologyGuidelines ? `
+## CARDIOLOGY GUIDELINE REVIEW:
+You are an expert in ACC/AHA/HRS guidelines. Actively review this dictation against current cardiology guidelines and provide alerts in the "guidelineAlerts" array when:
+
+**Heart Failure:**
+- HFrEF (EF ≤40%): Check for four pillars of GDMT (ARNI/ACEi/ARB, beta-blocker, MRA, SGLT2i)
+- HFrEF with EF ≤35%: Consider ICD for primary prevention after 3+ months optimized GDMT
+- HFrEF with LBBB and EF ≤35%: Consider CRT
+- HFpEF: SGLT2i recommended, diuretics for congestion
+
+**Atrial Fibrillation:**
+- Calculate CHA₂DS₂-VASc and recommend anticoagulation if ≥2 (men) or ≥3 (women)
+- Rate vs rhythm control considerations
+- Note if rate control target (<110 resting, or <80 if symptomatic) achieved
+- Ablation considerations for symptomatic AF on AAD
+
+**Valvular Disease:**
+- Severe AS (AVA <1.0, mean gradient >40, Vmax >4): Intervention if symptomatic or EF <50%
+- Severe MR: Surgery considerations based on EF, LVESD, symptoms
+- Indicate if valve intervention criteria may be met
+
+**Coronary Artery Disease:**
+- STEMI: Door-to-balloon <90 min, antiplatelet therapy, high-intensity statin
+- NSTEMI/UA: Risk stratification, early invasive vs conservative
+- Stable CAD: Optimal medical therapy, revascularization considerations
+- Secondary prevention: Statin, antiplatelet, BP control, diabetes management
+
+**Arrhythmias:**
+- Bradycardia: Pacemaker indications (symptomatic, Mobitz II, CHB, pauses >3s)
+- VT/VF: ICD indications, antiarrhythmic choice
+- Long QT: QTc thresholds, drug interactions
+
+**Lipids & Prevention:**
+- High-intensity statin for ASCVD
+- LDL targets based on risk category
+- PCSK9i considerations if LDL not at goal
+
+**Hypertension:**
+- BP targets by comorbidity (general <130/80, elderly considerations)
+- First-line agent selection based on comorbidities
+
+For each guideline alert, include:
+- guideline: The specific guideline name and year
+- finding: What in the note triggered this alert
+- recommendation: The guideline-based recommendation
+- class: Recommendation class (I, IIa, IIb, III) if applicable
+- level: Evidence level (A, B, C) if applicable
+
+Be proactive - if the clinical scenario suggests a guideline applies, mention it even if not explicitly asked.
+` : ''}
+Dictation to review:
+${text}`
+            }]
+        };
+        
+        // Add extended thinking if depth is not quick
+        if (thinkingBudget > 0) {
+            apiOptions.thinking = {
+                type: "enabled",
+                budget_tokens: thinkingBudget
+            };
+        }
+        
+        const message = await anthropic.messages.create(apiOptions);
+        
+        // Parse the response - handle thinking blocks if present
+        let responseText = '';
+        for (const block of message.content) {
+            if (block.type === 'text') {
+                responseText = block.text;
+                break;
+            }
+        }
+        
+        // Try to parse as JSON, handle potential markdown wrapping
+        let result;
+        try {
+            // Remove any markdown code block if present
+            const cleanJson = responseText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+            result = JSON.parse(cleanJson);
+        } catch (parseErr) {
+            console.error('JSON parse error:', parseErr.message);
+            result = {
+                issues: [{ type: "error", severity: "info", text: "Could not parse validation response" }],
+                corrected: null,
+                summary: "Validation completed but response format was unexpected"
+            };
+        }
+        
+        console.log(`[${new Date().toISOString()}] Validation complete (${model || 'sonnet'}): ${result.issues.length} issues found`);
+        res.json(result);
+        
+    } catch (err) {
+        console.error('Validation error:', err.message);
+        res.status(500).json({ 
+            error: 'Validation failed', 
+            message: err.message 
+        });
+    }
+});
+
+// Health check
+app.get('/api/health', async (req, res) => {
+    let dbStatus = 'not configured';
+    
+    if (process.env.DATABASE_URL) {
+        try {
+            await pool.query('SELECT 1');
+            dbStatus = 'connected';
+        } catch (err) {
+            dbStatus = 'error: ' + err.message;
+        }
+    }
+    
+    res.json({ 
+        status: 'ok', 
+        rooms: rooms.size,
+        database: dbStatus
+    });
+});
+
+// Serve the main page
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'index.html'));
+});
+
+app.listen(PORT, () => {
+    console.log(`Clipboard Sync server running on http://localhost:${PORT}`);
+});
